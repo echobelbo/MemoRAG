@@ -89,7 +89,7 @@ class GraphMemory(Memory):
                  config: Dict,
                  chunk_size:int = 256,
                  ret_model_name_or_path: str="BAAI/bge-m3",
-                 ret_hit: int = 3,
+                 ret_hit: int = 5,
                  cache_dir:Optional[str]=None):
         super().__init__(config)
         self.retriever = retriever
@@ -100,13 +100,14 @@ class GraphMemory(Memory):
         self.communities = {}
         self.refine_model = refine_model
         self.chunks = None
+        self.topk = ret_hit
         self.text_splitter = TextSplitter.from_tiktoken_model("gpt-3.5-turbo", chunk_size)
-        # self.retriever = DenseRetriever(
-        #     encoder = ret_model_name_or_path,
-        #     hits=ret_hit,
-        #     cache_dir=cache_dir
-        # )
-
+        self.retriever = DenseRetriever(
+            encoder = ret_model_name_or_path,
+            hits=ret_hit,
+            cache_dir=cache_dir
+        )
+        self.budget = 0
         
 
     def memorize(self, 
@@ -121,8 +122,8 @@ class GraphMemory(Memory):
 
         node2chunk={}
 
-        # self.retriever.remove_all()
-        # self.retriever.add(self.chunks)
+        self.retriever.remove_all()
+        self.retriever.add(self.chunks)
 
         if save_dir:
             if not os.path.exists(save_dir):
@@ -193,6 +194,12 @@ class GraphMemory(Memory):
             communities2:set{chunk3,...}
             }
             '''
+        self.chunks2communities = {}
+
+        for community, chunks in self.communities2chunk.items():
+            for chunk in chunks:
+                self.chunks2communities.setdefault(chunk, set()).add(community)
+
         print("Louvain communities:", self.communities)
         return
     
@@ -223,7 +230,32 @@ class GraphMemory(Memory):
 
         return sub_queries
 
-    def match_query(self, query: str, sub_queries: List[str]) -> List[str]:
+    def assess_relevance(self, chunks, query):
+        """
+        使用 LLM 评估文本块的相关性。
+        """
+        relevant_chunks = []
+        # relevant_score = []
+        for chunk in chunks:
+            relevance_score = self.llm_assessor(chunk, query)  # 假设llm_assessor返回相关性分数
+            # print(relevance_score)
+            if relevance_score > 0.6:  # 假设0.6为相关性阈值
+                relevant_chunks.append((chunk, relevance_score))
+        self.budget -= 1
+        return relevant_chunks
+    def llm_assessor(self, chunk, query):
+        prompt = zh_prompts["rel"].format(query=query, chunk=self.chunks[chunk])
+        result=self.refine_model.generate(prompt=prompt)[0]
+        try:
+            result = float(result)
+            return result
+        except ValueError:
+            print(f"无法将回答{result}转化为浮点数")
+            return 0
+        
+
+
+    def match_query(self, query: str, sub_queries: List[str], budget:int = 20, zero_limits:int = 3) -> List[int]:
         # for each sub-query, retrieve the most relevant chunks from the long document
         # build community structure for the chunks
         # rank the chunk communities by their relevance to the input query or the combined query 
@@ -231,19 +263,69 @@ class GraphMemory(Memory):
            # query + each chunks -> long sequence -> main query -> similarity
         # for each chunk community, select relevant chunks by measuring the semantic similarity between the chunks and the query
             #threshold = 0.6 reranker, matcher
-        retrieval_results = self._retrieve(queries=sub_queries)
-        print(retrieval_results)
+        # retrieval_results = self._retrieve(retrieval_query=sub_queries)
+        final_chunk=[]
+        topk_scores, topk_indices = self.retriever.search(queries=sub_queries)
         
+        for query_indice in range(len(sub_queries)):
+            self.budget = budget
+            community_scores = {}
+            for i, chunk_indice in enumerate(topk_indices[query_indice]):
+                for community in self.chunks2communities[chunk_indice]:
+                    community_scores.setdefault(community, 0)
+                    community_scores[community] += topk_scores[query_indice][i]
+            ranked_community = [key for key, value in sorted(community_scores.items(), key=lambda item: item[1], reverse=True)]
+            
+            visited_chunks = set()
+            visited_communities = set()
+            relevant_chunks_score_prepare = []
+            while ranked_community and self.budget > 0:
+                no_relevance_count = 0
+                rel_chunk_info = []
+                print(f"准备访问社区{ranked_community}")
+                for community in ranked_community:
+                    if community in visited_communities:
+                        ranked_community.remove(community)
+                        continue
+                    visited_communities.add(community)
 
+                    untested_chunks = [c for c in self.communities2chunk[community] if c not in visited_chunks]
+                    visited_chunks.update(untested_chunks)
+                    relevant_chunks_score= self.assess_relevance(untested_chunks, sub_queries[query_indice])
 
-        output = []
-        return output
+                    if relevant_chunks_score == []:
+                        no_relevance_count += 1
+                    else:
+                        relevant_chunks_score_prepare.extend(relevant_chunks_score)
+                        # rel_chunk_info.append(relevant_chunks)
+                        no_relevance_count = 0
+                    
+                    if no_relevance_count >= zero_limits:
+                        '''进行一次游走'''
+                        print("进行一次游走")
+                        new_community = set()
+                        new_community_scores = {}
+                        relevant_chunks_prepare = [sublist[0] for sublist in relevant_chunks_score_prepare]
+                        relevant_scores_prepare = [sublist[1] for sublist in relevant_chunks_score_prepare]
+                        for i, chunk in enumerate(relevant_chunks_prepare):
+                            new_community.update(self.chunks2communities[chunk])
+                            for community in self.chunks2communities[chunk]:
+                                new_community_scores.setdefault(community, 0)
+                                new_community_scores[community] += relevant_scores_prepare[i]
+                        new_community = sorted(list(new_community - visited_communities), reverse=True)
+                        ranked_community = list(new_community)
+                        print(f"已访问社区{visited_chunks}")
+                        break
+            final_chunk.extend([sublist[0] for sublist in relevant_chunks_score_prepare])
+            print(f"查询{query_indice}查询完毕，找到了如下chunks{relevant_chunks_score_prepare}")
+        print("final_chunk")            
+        return final_chunk
     
     def _retrieve(self, retrieval_query):
         topk_scores, topk_indices = self.retriever.search(queries=retrieval_query)
         topk_indices = list(chain(*[topk_index.tolist() for topk_index in topk_indices]))
         topk_indices = sorted(set([x for x in topk_indices if x > -1]))
-        return [self.chunks[i].strip() for i in topk_indices]
+        return topk_indices
     
     def map_answer(self, query: str, answer: str, max_length: int=1024) -> str:
         # open-sourced: qwen 2.5 3B, llama3.2 3B 

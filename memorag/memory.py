@@ -44,10 +44,10 @@ def girvan_newman(G: nx.Graph):
 
     # 返回分割后的连通组件
     return list(nx.connected_components(G_copy))
-def louvain_community_detection(G):
+def louvain_community_detection(G, resolution):
     # node_chunk = {node: G.nodes[node]["chunk_index"] for node in G.nodes}
 
-    partition = community_louvain.best_partition(G, resolution=5.0)
+    partition = community_louvain.best_partition(G, resolution=resolution)
     communities = {}
     for node, community in partition.items():
         if community not in communities:
@@ -89,7 +89,7 @@ class GraphMemory(Memory):
                  config: Dict,
                  chunk_size:int = 256,
                  ret_model_name_or_path: str="BAAI/bge-m3",
-                 ret_hit: int = 5,
+                 ret_hit: int = 10,
                  cache_dir:Optional[str]=None):
         super().__init__(config)
         self.retriever = retriever
@@ -121,6 +121,7 @@ class GraphMemory(Memory):
         self.chunks = self.text_splitter.chunks(context)
 
         node2chunk={}
+        self.chunk2node={}
 
         self.retriever.remove_all()
         self.retriever.add(self.chunks)
@@ -141,10 +142,12 @@ class GraphMemory(Memory):
                         sub_graph = json.load(f)
                         for node, neighbors in sub_graph.items():
                             self.graph.add_node(node)
+                            self.chunk2node.setdefault(index, set()).add(node)
                             node2chunk.setdefault(node, set()).update([index])
                             for neighbor in neighbors:
                                 self.graph.add_edge(node, neighbor)
                                 node2chunk.setdefault(neighbor, set()).update([index])
+                                self.chunk2node.setdefault(index, set()).add(neighbor)
                     index+=1
                 except Exception as e:
                     if hasattr(e, 'strerror') and e.strerror == 'No such file or directory' and index !=0:
@@ -166,8 +169,10 @@ class GraphMemory(Memory):
                     for node, neighbors in result.items():
                         self.graph.add_node(node)
                         node2chunk.setdefault(node, set()).update([index])
+                        self.chunk2node.setdefault(index, set()).add(node)
                         for neighbor in neighbors:
                             self.graph.add_edge(node, neighbor)
+                            self.chunk2node.setdefault(index, set()).add(node)
                             node2chunk.setdefault(neighbor, set()).update([index])
                     print(f"{index}json, dump finished")
                 except:
@@ -183,7 +188,13 @@ class GraphMemory(Memory):
 
         '''louvain '''
         self.communities2chunk = {}
-        self.communities, self.partition = louvain_community_detection(self.graph)
+        self.communities, self.partition = louvain_community_detection(self.graph, resolution=5)
+        # self.chunk2node={}
+        # for node, chunks in node2chunk.items():
+        #     for chunk in chunks:
+        #     # 将 chunk 映射到对应的节点
+        #         self.chunk2node.setdefault(chunk, set()).add(node)
+
         for node in self.graph.nodes:
             # if 
             self.communities2chunk.setdefault(self.partition[node], set()).update(node2chunk[node])
@@ -237,14 +248,14 @@ class GraphMemory(Memory):
         relevant_chunks = []
         # relevant_score = []
         for chunk in chunks:
-            relevance_score = self.llm_assessor(chunk, query)  # 假设llm_assessor返回相关性分数
+            relevance_score = self.llm_assessor(self.chunks[chunk], query)  # 假设llm_assessor返回相关性分数
             # print(relevance_score)
-            if relevance_score > 0.6:  # 假设0.6为相关性阈值
+            if relevance_score > 0.4:  # 假设0.4为相关性阈值
                 relevant_chunks.append((chunk, relevance_score))
         self.budget -= 1
         return relevant_chunks
     def llm_assessor(self, chunk, query):
-        prompt = zh_prompts["rel"].format(query=query, chunk=self.chunks[chunk])
+        prompt = zh_prompts["rel"].format(query=query, chunk=chunk)
         result=self.refine_model.generate(prompt=prompt)[0]
         try:
             result = float(result)
@@ -264,7 +275,7 @@ class GraphMemory(Memory):
         # for each chunk community, select relevant chunks by measuring the semantic similarity between the chunks and the query
             #threshold = 0.6 reranker, matcher
         # retrieval_results = self._retrieve(retrieval_query=sub_queries)
-        final_chunk=[]
+        final_chunk=set()
         topk_scores, topk_indices = self.retriever.search(queries=sub_queries)
         
         for query_indice in range(len(sub_queries)):
@@ -314,12 +325,12 @@ class GraphMemory(Memory):
                                 new_community_scores[community] += relevant_scores_prepare[i]
                         new_community = sorted(list(new_community - visited_communities), reverse=True)
                         ranked_community = list(new_community)
-                        print(f"已访问社区{visited_chunks}")
+                        print(f"已访问社区{visited_communities}")
                         break
-            final_chunk.extend([sublist[0] for sublist in relevant_chunks_score_prepare])
+            final_chunk.update([sublist[0] for sublist in relevant_chunks_score_prepare])
             print(f"查询{query_indice}查询完毕，找到了如下chunks{relevant_chunks_score_prepare}")
-        print("final_chunk")            
-        return final_chunk
+        # print("final_chunk")            
+        return list(final_chunk)
     
     def _retrieve(self, retrieval_query):
         topk_scores, topk_indices = self.retriever.search(queries=retrieval_query)
@@ -327,7 +338,7 @@ class GraphMemory(Memory):
         topk_indices = sorted(set([x for x in topk_indices if x > -1]))
         return topk_indices
     
-    def map_answer(self, query: str, answer: str, max_length: int=1024) -> str:
+    def map_answer(self, query: str, answer: str, max_length: int=1024, load: bool = True) -> str:
         # open-sourced: qwen 2.5 3B, llama3.2 3B 
         # API: gpt3.5 API stc. deepseek API 
 
@@ -335,7 +346,95 @@ class GraphMemory(Memory):
         # untill fit the predefined length
         # claim: 北京去年经济稳定增长，增长率高达8%
         # claim: 北京去年民生持续改善，居民收入稳步增长
-        pass
+        sub_graph = nx.Graph()
+        node2chunk={}
+        if load:
+            for index in answer:
+                 with open(f'./cache/json{index}', 'r', encoding='utf-8') as f:
+                        graph = json.load(f)
+                        for node, neighbors in graph.items():
+                            sub_graph.add_node(node)
+                            node2chunk.setdefault(node, set()).update([index])
+                            for neighbor in neighbors:
+                                sub_graph.add_edge(node, neighbor)
+                                node2chunk.setdefault(neighbor, set()).update([index])
+        else:
+            for index in answer:
+                chunk = self.chunks[index]
+                prompt = zh_prompts["ner_mem"].format(context=chunk)
+                response = self.extractor.generate(prompt)
+                result = json.loads(re.search(r'\{.*\}',response[0], re.DOTALL).group(0))
+                for node, neighbors in result.items():
+                    sub_graph.add_node(node)
+                    node2chunk.setdefault(node, set()).update([index])
+                    for neighbor in neighbors:
+                        sub_graph.add_edge(node, neighbor)
+                        node2chunk.setdefault(neighbor, set()).update([index])
+        
+        communities2chunk = {}
+        sub_comm, sub_partition = louvain_community_detection(sub_graph, resolution=1)
+        claim_list = []
+        for node in sub_graph.nodes:
+            # if 
+            communities2chunk.setdefault(sub_partition[node], set()).update(node2chunk[node])
+
+        community_graph = nx.Graph()
+        '''根据communities2chunk建立一个子图，强连通分量聚为一类'''
+        community_graph.add_nodes_from(answer)
+        for community, chunks in  communities2chunk.items():
+            chunks = list(chunks)
+            for i in range(len(chunks)):
+                # community_graph.add_node()
+                for j in range(i + 1, len(chunks)):
+                    community_graph.add_edge(chunks[i], chunks[j])
+
+        connected_components = list(nx.connected_components(community_graph))
+        # chunk_to_cluster = {}
+        # for cluster_id, component in enumerate(connected_components):
+        #     for chunk in component:
+        #         chunk_to_cluster[chunk] = cluster_id
+
+        for component in connected_components:
+            chunks = list(component)
+            group_text = "".join([self.chunks[chunk] + "\n" for chunk in chunks])
+            prompt = zh_prompts["claim_gen"].format(query = query, group_text = group_text)
+            claim = self.refine_model.generate(prompt)[0]
+            claim_list.extend(claim.split("\n"))
+
+
+
+        # for community, chunks in communities2chunk.items():
+        #     group_text = ""
+        #     for chunk in chunks:
+        #         group_text.join(self.chunks[chunk]+"\n")
+        #     prompt = zh_prompts["claim_gen"].format(query = query, context = group_text)
+        #     claim = self.refine_model.generate(prompt)[0]
+        #     claim_list.extend(claim.split("\n"))
+
+
+        scored_claims = [(claim, self.llm_assessor(chunk = claim, query = query)) for claim in claim_list]
+        scored_claims.sort(key=lambda x: x[1], reverse=True)
+        selected_claims = []
+        current_length = 0
+        
+        for claim, _ in scored_claims:
+            if current_length + len(claim) + 1 <= max_length:  # +1 为换行符
+                selected_claims.append(claim)
+                current_length += len(claim) + 1
+            else:
+                break
+        
+        return selected_claims
+
+
+
+
+
+
+
+
+
+        
 
     def reduce_answer(self, query: str, answer: str) -> str:
         # open-sourced: qwen 2.5 3B, llama3.2 3B 

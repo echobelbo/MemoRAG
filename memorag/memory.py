@@ -54,7 +54,7 @@ def louvain_community_detection(G, resolution):
             communities[community] = []
         communities[community].append(node)
     return communities, partition
-def get_similar_entity(model, graph, word, threshold=0.8):
+def get_similar_entity(model, graph, word, threshold=0.7):
     """
     根据词向量相似度判断是否为同义词，并返回归一化的词
     """
@@ -214,7 +214,7 @@ class GraphMemory(Memory):
         print("Louvain communities:", self.communities)
         return
     
-    def refine_query(self, query: str) -> str:
+    def refine_query(self, query: str, graph_refine:bool=False) -> str:
         # open-sourced: qwen 2.5 3B, llama3.2 3B 
         # API: gpt3.5 API stc. deepseek API 
         # prompt the model to refine the query into sub-questions
@@ -224,22 +224,34 @@ class GraphMemory(Memory):
         #        北京去年科技怎么样？
         #        海淀区去年怎么样？
         prompt = zh_prompts["sur"].format(question=query)
-        surrogate_queries = self.refine_model.generate(prompt)
-        sub_queries = surrogate_queries[0].split("\n")
-        # sub_ner = [self.refine_model.generate(zh_prompts["ner_qa"].format(question=subquery)) for subquery in sub_queries]
-
-        # TODO discuss how to refine
-        # LLM refine
-        # graph structure -> useful info
-        # prompt
-        
-        # prompt = zh_prompts["ner_qa"].format(question=query)
-        # query_ent = self.refine_model.generate(prompt)
-        # print(query_ent)
-
-        print(surrogate_queries)
-
+        surrogate_queries = self.refine_model.generate(prompt)[0]
+        sub_queries = surrogate_queries.split("\n")
+        if graph_refine:
+            sub_ner = [self.refine_model.generate(zh_prompts["ner_qa"].format(question=subquery))[0] for subquery in sub_queries]
+            nlp = spacy.load("zh_core_web_md")
+            # ent2node={}
+            refine_sub_queries = []
+            for index, ent_list in enumerate(sub_ner):
+                key_words = set()
+                ent_list = ent_list.split(", ")
+                for ent in ent_list:
+                    # if ent in ent2node.keys():
+                    #     continue
+                    word1=nlp(ent)
+                    for node in self.graph.nodes:
+                        word2=nlp(node)
+                        if word1.similarity(word2) >= 0.7:
+                            # ent2node.setdefault(ent, []).append(node)
+                            key_words.update(self.graph.neighbors(node))
+                            key_words.add(node)
+                key_words=",".join(key_words)
+                prompt=zh_prompts["keyword_refine"].format(query=sub_queries[index], key_words=key_words)
+                refine_sub_queries.append(self.refine_model.generate(prompt)[0])
+            print(refine_sub_queries)
+            return refine_sub_queries
         return sub_queries
+
+
 
     def assess_relevance(self, chunks, query):
         """

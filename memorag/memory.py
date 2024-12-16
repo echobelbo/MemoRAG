@@ -13,6 +13,10 @@ import community as community_louvain
 import pickle
 from itertools import chain
 import os
+import logging
+from datetime import datetime
+
+
 # from networkx.algorithms.community import girvan_newman
 # from spacy.lang.zh.examples import sentences
 
@@ -83,7 +87,7 @@ class Memory:
 
 class GraphMemory(Memory):
     def __init__(self, 
-                 retriever,
+                #  retriever,
                  extractor: Agent,
                  refine_model: Agent, 
                  config: Dict,
@@ -92,9 +96,9 @@ class GraphMemory(Memory):
                  ret_hit: int = 10,
                  cache_dir:Optional[str]=None):
         super().__init__(config)
-        self.retriever = retriever
+        # self.retriever = retriever
         self.graph = nx.Graph()
-        self.nlp_model = spacy.load("zh_core_web_sm")
+        # self.nlp_model = spacy.load("zh_core_web_sm")
         self.extractor = extractor
         self.partition = {}
         self.communities = {}
@@ -108,18 +112,27 @@ class GraphMemory(Memory):
             cache_dir=cache_dir
         )
         self.budget = 0
-        
+
+
+        now = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        log_filename = f'./log/{now}.log'
+        self.logger = logging.getLogger(f"custom_logger{now}")
+        self.logger.setLevel(logging.INFO)
+        file_handler = logging.FileHandler(log_filename)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        file_handler.setFormatter(formatter)
+        self.logger.addHandler(file_handler)
 
     def memorize(self, 
                  context: str,
-                 load: bool = True,
+                 load: bool = False,
                  save_dir: str = None
                  ) -> None:
         # tools and deployed model: Spacy -> 
         # API: aliyun API stc. deepseek API  -> ner / deepseek
         index = 0            
         self.chunks = self.text_splitter.chunks(context)
-
+        self.logger.info(f"{self.chunks[0]}")
         node2chunk={}
         self.chunk2node={}
 
@@ -136,7 +149,7 @@ class GraphMemory(Memory):
             # self._print_stats(save_dir, context)
 
         if load:
-            while(True):
+            for index in range(len(self.chunks)):
                 try:
                     with open(f'./cache/json{index}', 'r', encoding='utf-8') as f:
                         sub_graph = json.load(f)
@@ -148,14 +161,13 @@ class GraphMemory(Memory):
                                 self.graph.add_edge(node, neighbor)
                                 node2chunk.setdefault(neighbor, set()).update([index])
                                 self.chunk2node.setdefault(index, set()).add(neighbor)
-                    index+=1
                 except Exception as e:
-                    if hasattr(e, 'strerror') and e.strerror == 'No such file or directory' and index !=0:
-                        print("load finished")
-                        break
-                    else:
-                        print(f"no file to load or {e}")
-                        exit
+                    # if hasattr(e, 'strerror') and e.strerror == 'No such file or directory' and index !=0:
+                    #     print("load finished")
+                    #     break
+                    self.logger.warning(f"no file to load or {e}")
+                    # exit
+            self.logger.info("load finish")
         else:
             # text_splitter = TextSplitter.from_tiktoken_model("gpt-3.5-turbo", chunk_size)
             # chunk_index = 0
@@ -174,12 +186,12 @@ class GraphMemory(Memory):
                             self.graph.add_edge(node, neighbor)
                             self.chunk2node.setdefault(index, set()).add(node)
                             node2chunk.setdefault(neighbor, set()).update([index])
-                    print(f"{index}json, dump finished")
+                    self.logger.info(f"{index}json, dump finished")
                 except:
                     print(response)
                     print(chunk)
                 index+=1
-        print(self.graph)
+        # print(self.graph)
 
         ''' girvan_newman'''
         # communities = girvan_newman(self.graph)
@@ -211,7 +223,7 @@ class GraphMemory(Memory):
             for chunk in chunks:
                 self.chunks2communities.setdefault(chunk, set()).add(community)
 
-        print("Louvain communities:", self.communities)
+        # print("Louvain communities:", self.communities)
         return
     
     def refine_query(self, query: str, graph_refine:bool=False) -> str:
@@ -226,6 +238,7 @@ class GraphMemory(Memory):
         prompt = zh_prompts["sur"].format(question=query)
         surrogate_queries = self.refine_model.generate(prompt)[0]
         sub_queries = surrogate_queries.split("\n")
+        sub_queries = [q for q in sub_queries if q != ""]
         if graph_refine:
             sub_ner = [self.refine_model.generate(zh_prompts["ner_qa"].format(question=subquery))[0] for subquery in sub_queries]
             nlp = spacy.load("zh_core_web_md")
@@ -240,15 +253,31 @@ class GraphMemory(Memory):
                     word1=nlp(ent)
                     for node in self.graph.nodes:
                         word2=nlp(node)
-                        if word1.similarity(word2) >= 0.7:
+                        if word2.vector_norm > 0 and word1.similarity(word2) >= 0.7:
                             # ent2node.setdefault(ent, []).append(node)
                             key_words.update(self.graph.neighbors(node))
-                            key_words.add(node)
-                key_words=",".join(key_words)
+                            if word1 != word2:
+                                key_words.add(node)
+                query_doc = nlp(sub_queries[index])
+                keyword_docs = [nlp(keyword) for keyword in key_words]
+                # 过滤掉空向量
+                filtered_keywords = [
+                (keyword, keyword_doc) 
+                for keyword, keyword_doc in zip(key_words, keyword_docs) 
+                if keyword_doc.vector_norm > 0
+                ]
+
+                similarities = [(keyword, query_doc.similarity(keyword_doc)) for keyword, keyword_doc in filtered_keywords]
+                sorted_keywords = sorted(similarities, key=lambda x: x[1], reverse=True)
+                sorted_keywords = [key_word for key_word, _ in sorted_keywords][:5]
+                key_words=",".join(sorted_keywords)
+                #TODO 过滤 relevant keywords sample
                 prompt=zh_prompts["keyword_refine"].format(query=sub_queries[index], key_words=key_words)
                 refine_sub_queries.append(self.refine_model.generate(prompt)[0])
-            print(refine_sub_queries)
+            self.logger.info(refine_sub_queries)
             return refine_sub_queries
+        self.logger.info(sub_queries)
+
         return sub_queries
 
 
@@ -262,7 +291,7 @@ class GraphMemory(Memory):
         for chunk in chunks:
             relevance_score = self.llm_assessor(self.chunks[chunk], query)  # 假设llm_assessor返回相关性分数
             # print(relevance_score)
-            if relevance_score > 0.4:  # 假设0.4为相关性阈值
+            if relevance_score > 0.7:  # 假设0.4为相关性阈值
                 relevant_chunks.append((chunk, relevance_score))
         self.budget -= 1
         return relevant_chunks
@@ -273,7 +302,7 @@ class GraphMemory(Memory):
             result = float(result)
             return result
         except ValueError:
-            print(f"无法将回答{result}转化为浮点数")
+            self.logger.warning(f"无法将回答{result}转化为浮点数")
             return 0
         
 
@@ -294,9 +323,12 @@ class GraphMemory(Memory):
             self.budget = budget
             community_scores = {}
             for i, chunk_indice in enumerate(topk_indices[query_indice]):
-                for community in self.chunks2communities[chunk_indice]:
-                    community_scores.setdefault(community, 0)
-                    community_scores[community] += topk_scores[query_indice][i]
+                try:
+                    for community in self.chunks2communities[chunk_indice]:
+                        community_scores.setdefault(community, 0)
+                        community_scores[community] += topk_scores[query_indice][i]
+                except KeyError:
+                        self.logger.warning(f"Warning: chunk_indice {chunk_indice} not found in chunks2communities.")
             ranked_community = [key for key, value in sorted(community_scores.items(), key=lambda item: item[1], reverse=True)]
             
             visited_chunks = set()
@@ -305,7 +337,7 @@ class GraphMemory(Memory):
             while ranked_community and self.budget > 0:
                 no_relevance_count = 0
                 rel_chunk_info = []
-                print(f"准备访问社区{ranked_community}")
+                self.logger.info(f"准备访问社区{ranked_community}")
                 for community in ranked_community:
                     if community in visited_communities:
                         ranked_community.remove(community)
@@ -325,7 +357,7 @@ class GraphMemory(Memory):
                     
                     if no_relevance_count >= zero_limits:
                         '''进行一次游走'''
-                        print("进行一次游走")
+                        self.logger.info("进行一次游走")
                         new_community = set()
                         new_community_scores = {}
                         relevant_chunks_prepare = [sublist[0] for sublist in relevant_chunks_score_prepare]
@@ -337,10 +369,10 @@ class GraphMemory(Memory):
                                 new_community_scores[community] += relevant_scores_prepare[i]
                         new_community = sorted(list(new_community - visited_communities), reverse=True)
                         ranked_community = list(new_community)
-                        print(f"已访问社区{visited_communities}")
+                        self.logger.info(f"已访问社区{visited_communities}")
                         break
             final_chunk.update([sublist[0] for sublist in relevant_chunks_score_prepare])
-            print(f"查询{query_indice}查询完毕，找到了如下chunks{relevant_chunks_score_prepare}")
+            self.logger.info(f"查询{query_indice}查询完毕，找到了如下chunks{relevant_chunks_score_prepare}")
         # print("final_chunk")            
         return list(final_chunk)
     
@@ -350,7 +382,7 @@ class GraphMemory(Memory):
         topk_indices = sorted(set([x for x in topk_indices if x > -1]))
         return topk_indices
     
-    def map_answer(self, query: str, answer: str, max_length: int=1024, load: bool = True) -> str:
+    def map_answer(self, query: str, answer: str, max_length: int=2048, load: bool = True) -> str:
         # open-sourced: qwen 2.5 3B, llama3.2 3B 
         # API: gpt3.5 API stc. deepseek API 
 
@@ -435,8 +467,8 @@ class GraphMemory(Memory):
                 current_length += len(claim) + 1
             else:
                 break
-        
-        return selected_claims
+        self.logger.info(selected_claims)
+        return "\n".join(selected_claims)
 
 
 
@@ -448,12 +480,17 @@ class GraphMemory(Memory):
 
         
 
-    def reduce_answer(self, query: str, answer: str) -> str:
+    def reduce_answer(self, query: str, context: str) -> str:
         # open-sourced: qwen 2.5 3B, llama3.2 3B 
         # API: gpt3.5 API stc. deepseek API 
 
         # produce the final answer from the useful claims
-        pass
+
+        # pass
+        prompt = zh_prompts["multifieldqa_zh"].format(input = query, context = context)
+
+        return self.refine_model.generate(prompt=prompt)[0]
+
 
     def __call__(self, query: str, context: str) -> str:
         answer = ""
